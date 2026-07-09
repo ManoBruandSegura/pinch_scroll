@@ -7,7 +7,9 @@ scrolling, just keep holding the offset.
 
 Sweep a hand quickly sideways to switch app windows. Open apps form a fixed
 ring (stable for as long as they stay open — no Alt+Tab recency reshuffling):
-sweep right = next app, sweep left = previous app, instantly.
+sweep right = next app, sweep left = previous app, instantly. Sweep detection
+is motion-based (frame differencing), not landmark-based: the tracker loses a
+fast hand to motion blur, but blur only makes the motion signal stronger.
 
 Runs headless. Launching it again stops the running instance (high beep = started,
 low beep = stopped).
@@ -36,11 +38,16 @@ SMOOTH = 0.5        # 0..1, higher = snappier but jitterier position tracking
 # frame doesn't drop the pinch.
 PINCH_ON = 0.35
 PINCH_OFF = 0.55
-# Sweep = unpinched wrist travelling SWIPE_DIST (fraction of frame width)
-# within SWIPE_TIME seconds. Cooldown so one sweep fires one switcher step.
-SWIPE_DIST = 0.25  # tracker drops blurred hands mid-sweep, so full travel is rare
-SWIPE_TIME = 0.6   # wide enough to bridge a tracking dropout + re-detection
-SWIPE_COOLDOWN = 0.8
+# Sweep = the motion centroid travelling SWIPE_DIST (fraction of frame width)
+# mostly-horizontally within SWIPE_TIME seconds.
+SWIPE_DIST = 0.25
+SWIPE_TIME = 0.4
+SWIPE_COOLDOWN = 0.6    # min gap between sweeps in the same direction
+REVERSE_COOLDOWN = 1.5  # min gap before the opposite direction fires: the fast
+                        # return stroke after a sweep must not undo the switch
+MOTION_PX = 25     # gray-level change for a pixel to count as moving
+MOTION_MIN = 0.02  # moving-pixel fraction below this = noise, ignore
+MOTION_MAX = 0.5   # above this = scene/lighting change, not a hand
 
 VK_ALT = 0x12
 
@@ -112,12 +119,13 @@ def switch_window(step):
     key(VK_ALT, up=True)
 
 
-def update_trail(trail, t, x):
-    """Add a wrist sample, drop ones older than SWIPE_TIME, return signed travel."""
-    trail.append((t, x))
+def update_trail(trail, t, x, y):
+    """Add a motion-centroid sample, drop ones older than SWIPE_TIME,
+    return signed (dx, dy) travel across the window."""
+    trail.append((t, x, y))
     while t - trail[0][0] > SWIPE_TIME:
         trail.popleft()
-    return x - trail[0][1]
+    return x - trail[0][1], y - trail[0][2]
 
 
 def pinch_ratio(lm):
@@ -171,8 +179,10 @@ def main():
     prev_t = None
     pinching = False
     acc = 0.0  # fractional wheel units carried between frames
-    trail = deque()  # recent (t, wrist x) samples for sweep detection
+    trail = deque()  # recent (t, motion-centroid x, y) samples for sweep detection
     last_swipe = 0.0
+    last_step = 0
+    prev_small = None
     try:
         while True:
             ok, frame = cap.read()
@@ -180,24 +190,34 @@ def main():
                 break
             now = time.time()
             result = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            dx = 0.0
             if result.multi_hand_landmarks:
                 lm = result.multi_hand_landmarks[0].landmark
                 pinching = pinch_ratio(lm) < (PINCH_OFF if pinching else PINCH_ON)
-                # Sweep tracking runs even while "pinching": a relaxed swiping
-                # hand often reads as a pinch (thumb rests near the index).
-                # If the hand drops out mid-sweep (motion blur), the trail
-                # survives; time-based pruning discards stale samples.
-                dx = update_trail(trail, now, lm[0].x)
-                if abs(dx) > SWIPE_DIST and now - last_swipe > SWIPE_COOLDOWN:
-                    switch_window(1 if dx < 0 else -1)  # unmirrored cam: user-right = -x
-                    winsound.Beep(1200, 30)  # click: sweep registered
-                    last_swipe = now
-                    trail.clear()
-                    anchor_y = None  # a sweep is not a scroll: drop any anchor
-                    pinching = False
             else:
                 pinching = False
+            # Sweep detection: centroid of changed pixels between consecutive
+            # (downscaled) frames. Works at any hand speed — blur only makes
+            # the diff stronger — and needs no landmark tracking at all.
+            small = cv2.cvtColor(cv2.resize(frame, (80, 45)), cv2.COLOR_BGR2GRAY)
+            frac = dx = dy = 0.0
+            if prev_small is not None:
+                moving = cv2.absdiff(small, prev_small) > MOTION_PX
+                frac = moving.mean()
+                if MOTION_MIN < frac < MOTION_MAX:
+                    ys, xs = moving.nonzero()
+                    dx, dy = update_trail(trail, now, xs.mean() / moving.shape[1],
+                                          ys.mean() / moving.shape[0])
+                    step = 1 if dx < 0 else -1  # unmirrored cam: user-right = -x
+                    gap = now - last_swipe
+                    if (abs(dx) > SWIPE_DIST and abs(dx) > 2 * abs(dy)  # horizontal
+                            and gap > SWIPE_COOLDOWN
+                            and (step == last_step or gap > REVERSE_COOLDOWN)):
+                        switch_window(step)
+                        winsound.Beep(1200, 30)  # click: sweep registered
+                        last_swipe, last_step = now, step
+                        trail.clear()
+                        anchor_y = None  # a sweep is not a scroll: drop any anchor
+            prev_small = small
             if pinching:
                 y = lm[0].y  # wrist: steadier than fingertips
                 if anchor_y is None:
@@ -215,7 +235,7 @@ def main():
             if debug:
                 cv2.putText(frame,
                             f"hand {'Y' if result.multi_hand_landmarks else '-'}"
-                            f"  pinch {int(pinching)}  dx {dx:+.2f}",
+                            f"  pinch {int(pinching)}  mot {frac:.2f}  dx {dx:+.2f}",
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.imshow("pinch_scroll debug", frame)
                 cv2.waitKey(1)
@@ -250,17 +270,18 @@ if __name__ == "__main__":
 
     # self-check: fast sweep crosses SWIPE_DIST inside the window, slow drift doesn't
     fast = deque()
-    assert any(abs(update_trail(fast, t / 30, 0.2 + t / 30 * 2.5)) > SWIPE_DIST
+    assert any(abs(update_trail(fast, t / 30, 0.2 + t / 30 * 2.5, 0.5)[0]) > SWIPE_DIST
                for t in range(14))           # 2.5 frame-widths/sec
     slow = deque()
-    assert not any(abs(update_trail(slow, t / 30, 0.2 + t / 30 * 0.3)) > SWIPE_DIST
+    assert not any(abs(update_trail(slow, t / 30, 0.2 + t / 30 * 0.3, 0.5)[0]) > SWIPE_DIST
                    for t in range(60))       # repositioning-speed drift stays under
     assert len(slow) <= SWIPE_TIME * 30 + 1  # old samples really get pruned
 
-    # self-check: sign convention — user sweeping right = image x decreasing
+    # self-check: rightward sweep = image x decreasing, and it reads as horizontal
     r = deque()
-    update_trail(r, 0, 0.8)
-    assert update_trail(r, 0.1, 0.3) < 0     # negative dx -> switch_window(+1)
+    update_trail(r, 0, 0.8, 0.50)
+    dx, dy = update_trail(r, 0.1, 0.4, 0.45)
+    assert dx < -SWIPE_DIST and abs(dx) > 2 * abs(dy)  # -> switch_window(+1)
 
     # self-check: the window ring is non-empty and stable across two scans
     ring = app_windows()
