@@ -13,7 +13,7 @@ No need to reposition your hand; to keep scrolling, just keep holding the offset
 ## Features
 
 - **Joystick-style scrolling**: Effortlessly scroll long documents without repetitive gestures.
-- **Sweep to switch windows**: Sweep an open (unpinched) hand quickly sideways to Alt+Tab to the previous window.
+- **Sweep to switch windows**: Sweep an open (unpinched) hand quickly sideways to open the Alt+Tab switcher. Each sweep steps it (right = forward, left = back), a short beep confirms each step, and pausing ~1 second lands on the selected window.
 - **Headless and lightweight**: Runs silently in the background without opening any distracting windows.
 - **Toggle to Stop**: Run the application once to start it. Run it again to gracefully stop the existing instance.
 - **Audible Cues**: Emits a high-pitched beep when started and a low-pitched beep when stopped.
@@ -61,6 +61,7 @@ SMOOTH = 0.5        # 0..1, higher = snappier but jitterier position tracking
 PINCH_ON = 0.35     # pinch detection threshold
 PINCH_OFF = 0.55    # pinch release threshold (hysteresis)
 SWIPE_DIST = 0.35   # fraction of frame width a sweep must cover
-SWIPE_TIME = 0.25   # seconds the sweep must fit within
+SWIPE_TIME = 0.4    # seconds the sweep must fit within
 SWIPE_COOLDOWN = 0.8  # seconds before another sweep can fire
+ALT_HOLD = 1.2      # seconds of pause before the switcher commits
 ```

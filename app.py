@@ -5,7 +5,9 @@ scroll down, above it to scroll up — the further from neutral, the faster
 (accelerating curve). Release the pinch to stop. No need to reposition: to keep
 scrolling, just keep holding the offset.
 
-Sweep an open (unpinched) hand quickly sideways to switch windows (Alt+Tab).
+Sweep an open (unpinched) hand quickly sideways to switch windows: the Alt+Tab
+switcher opens and each sweep steps it (right sweep = forward, left = back).
+Pause to land on the selected window.
 
 Runs headless. Launching it again stops the running instance (high beep = started,
 low beep = stopped).
@@ -34,28 +36,39 @@ SMOOTH = 0.5        # 0..1, higher = snappier but jitterier position tracking
 PINCH_ON = 0.35
 PINCH_OFF = 0.55
 # Sweep = unpinched wrist travelling SWIPE_DIST (fraction of frame width)
-# within SWIPE_TIME seconds. Cooldown so one sweep fires one Alt+Tab.
+# within SWIPE_TIME seconds. Cooldown so one sweep fires one switcher step.
 SWIPE_DIST = 0.35
-SWIPE_TIME = 0.25
+SWIPE_TIME = 0.4
 SWIPE_COOLDOWN = 0.8
+ALT_HOLD = 1.2  # Alt stays down this long after a sweep; pausing commits the switch
+
+VK_ALT, VK_TAB, VK_SHIFT = 0x12, 0x09, 0x10
 
 
 def scroll(amount):
     ctypes.windll.user32.mouse_event(0x0800, 0, 0, int(amount), 0)  # MOUSEEVENTF_WHEEL
 
 
-def alt_tab():
-    """Quick Alt+Tab tap: switches to the previous window."""
-    for vk, flag in ((0x12, 0), (0x09, 0), (0x09, 2), (0x12, 2)):  # alt/tab down, up
-        ctypes.windll.user32.keybd_event(vk, 0, flag, 0)
+def key(vk, up=False):
+    ctypes.windll.user32.keybd_event(vk, 0, 2 * up, 0)  # 2 = KEYEVENTF_KEYUP
+
+
+def tab_step(forward):
+    """One step in the Alt+Tab switcher (Alt must already be held down)."""
+    if not forward:
+        key(VK_SHIFT)
+    key(VK_TAB)
+    key(VK_TAB, up=True)
+    if not forward:
+        key(VK_SHIFT, up=True)
 
 
 def update_trail(trail, t, x):
-    """Add a wrist sample, drop ones older than SWIPE_TIME, return travel."""
+    """Add a wrist sample, drop ones older than SWIPE_TIME, return signed travel."""
     trail.append((t, x))
     while t - trail[0][0] > SWIPE_TIME:
         trail.popleft()
-    return abs(x - trail[0][1])
+    return x - trail[0][1]
 
 
 def pinch_ratio(lm):
@@ -110,6 +123,7 @@ def main():
     acc = 0.0  # fractional wheel units carried between frames
     trail = deque()  # recent (t, wrist x) samples for sweep detection
     last_swipe = 0.0
+    alt_held = False
     try:
         while True:
             ok, frame = cap.read()
@@ -122,6 +136,9 @@ def main():
                 pinching = pinch_ratio(lm) < (PINCH_OFF if pinching else PINCH_ON)
             else:
                 pinching = False
+            if alt_held and (pinching or now - last_swipe > ALT_HOLD):
+                key(VK_ALT, up=True)  # commit the selected window
+                alt_held = False
             if pinching:
                 trail.clear()  # scroll mode: hand motion is not a sweep
                 y = lm[0].y  # wrist: steadier than fingertips
@@ -138,16 +155,22 @@ def main():
                 anchor_y = None
                 acc = 0.0
                 if result.multi_hand_landmarks:
-                    if (update_trail(trail, now, lm[0].x) > SWIPE_DIST
-                            and now - last_swipe > SWIPE_COOLDOWN):
-                        alt_tab()
+                    dx = update_trail(trail, now, lm[0].x)
+                    if abs(dx) > SWIPE_DIST and now - last_swipe > SWIPE_COOLDOWN:
+                        if not alt_held:
+                            key(VK_ALT)  # opens the switcher UI
+                            alt_held = True
+                        tab_step(dx < 0)  # raw webcam is unmirrored: user-right = -x
+                        winsound.Beep(1200, 30)  # click: sweep registered
                         last_swipe = now
                         trail.clear()
-                else:
-                    trail.clear()  # hand lost: don't bridge across reappearance
+                # hand lost = usually motion blur mid-sweep; keep the trail,
+                # time-based pruning discards it if the hand stays gone
     except KeyboardInterrupt:
         pass
     finally:
+        if alt_held:
+            key(VK_ALT, up=True)  # toggle-kill skips this; 1.2s window, tiny risk
         cap.release()
         try:
             os.remove(PIDFILE)  # killed-via-toggle leaves this to the tasklist check
@@ -176,10 +199,15 @@ if __name__ == "__main__":
 
     # self-check: fast sweep crosses SWIPE_DIST inside the window, slow drift doesn't
     fast = deque()
-    assert any(update_trail(fast, t / 30, 0.2 + t / 30 * 2.5) > SWIPE_DIST
-               for t in range(8))            # 2.5 frame-widths/sec for ~0.25s
+    assert any(abs(update_trail(fast, t / 30, 0.2 + t / 30 * 2.5)) > SWIPE_DIST
+               for t in range(14))           # 2.5 frame-widths/sec
     slow = deque()
-    assert not any(update_trail(slow, t / 30, 0.2 + t / 30 * 0.5) > SWIPE_DIST
-                   for t in range(60))       # same 1s distance, spread over 2s
+    assert not any(abs(update_trail(slow, t / 30, 0.2 + t / 30 * 0.5)) > SWIPE_DIST
+                   for t in range(60))       # same distance, 5x slower
     assert len(slow) <= SWIPE_TIME * 30 + 1  # old samples really get pruned
+
+    # self-check: sign convention — user sweeping right = image x decreasing
+    r = deque()
+    update_trail(r, 0, 0.8)
+    assert update_trail(r, 0.1, 0.3) < 0     # negative dx -> tab_step(forward=True)
     main()
