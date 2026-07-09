@@ -77,7 +77,7 @@ def main():
                                      model_complexity=1,
                                      min_detection_confidence=0.6,
                                      min_tracking_confidence=0.3)
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # MSMF backend takes ~16s to open here
     if not cap.isOpened():
         raise SystemExit("No camera found.")
 
