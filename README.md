@@ -1,4 +1,4 @@
-# Pinch Scroll 🤏
+# Pinch Scroll 
 
 A lightweight, headless Python utility that lets you scroll your PC using a pinch gesture with your webcam.
 
