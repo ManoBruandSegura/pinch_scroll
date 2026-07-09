@@ -13,13 +13,9 @@ import math
 import os
 import signal
 import subprocess
-import sys
 import tempfile
 import time
 import winsound
-
-import cv2
-import mediapipe as mp
 
 PIDFILE = os.path.join(tempfile.gettempdir(), "pinch_scroll.pid")
 
@@ -71,6 +67,8 @@ def main():
     if stop_existing():
         winsound.Beep(400, 200)  # low beep: stopped
         return
+    import cv2  # heavy imports (~2s) deferred past the toggle check: stopping is instant
+    import mediapipe as mp
     with open(PIDFILE, "w") as f:
         f.write(str(os.getpid()))
     hands = mp.solutions.hands.Hands(max_num_hands=1,
