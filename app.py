@@ -5,6 +5,12 @@ scroll down, above it to scroll up — the further from neutral, the faster
 (accelerating curve). Release the pinch to stop. No need to reposition: to keep
 scrolling, just keep holding the offset.
 
+Pinch thumb + middle finger and twist like a knob to change the system volume:
+clockwise = up, counterclockwise = down.
+
+Cover the webcam with your hand for ~a second to mute/unmute the system
+microphone (low beep = muted, high beep = live again).
+
 Sweep a hand quickly sideways to switch app windows. Open apps form a fixed
 ring (stable for as long as they stay open — no Alt+Tab recency reshuffling):
 sweep right = next app, sweep left = previous app, instantly. Sweep detection
@@ -38,9 +44,11 @@ SMOOTH = 0.5        # 0..1, higher = snappier but jitterier position tracking
 # frame doesn't drop the pinch.
 PINCH_ON = 0.35
 PINCH_OFF = 0.55
+PINCH_FRAMES = 3  # frames the same finger must stay nearest before a pinch latches
+VOL_STEP = 8  # degrees of knob twist per volume tick (Windows: 1 tick = 2%)
 # Sweep = the motion centroid travelling SWIPE_DIST (fraction of frame width)
 # mostly-horizontally within SWIPE_TIME seconds.
-SWIPE_DIST = 0.25
+SWIPE_DIST = 0.4  # a hand approaching the camera drifts the centroid ~0.3; stay above
 SWIPE_TIME = 0.4
 SWIPE_COOLDOWN = 0.6    # min gap between sweeps in the same direction
 REVERSE_COOLDOWN = 1.5  # min gap before the opposite direction fires: the fast
@@ -48,8 +56,12 @@ REVERSE_COOLDOWN = 1.5  # min gap before the opposite direction fires: the fast
 MOTION_PX = 25     # gray-level change for a pixel to count as moving
 MOTION_MIN = 0.02  # moving-pixel fraction below this = noise, ignore
 MOTION_MAX = 0.5   # above this = scene/lighting change, not a hand
+IDLE_AFTER = 30    # s without motion -> standby: skip hand tracking until motion wakes it
+COVER_DARK = 40    # mean gray level below this = webcam covered by a hand
+COVER_TIME = 0.8   # s the cover must be held before the mic mute toggles
 
 VK_ALT = 0x12
+VK_VOL_UP, VK_VOL_DOWN = 0xAF, 0xAE
 
 user32 = ctypes.windll.user32
 # HWNDs must round-trip as pointers, not default 32-bit ints
@@ -128,9 +140,67 @@ def update_trail(trail, t, x, y):
     return x - trail[0][1], y - trail[0][2]
 
 
-def pinch_ratio(lm):
+def pinch_ratio(lm, tip=8):
+    """Thumb-tip gap to `tip` (8 = index: scroll, 12 = middle: volume knob)."""
     hand = math.hypot(lm[0].x - lm[9].x, lm[0].y - lm[9].y)  # wrist -> middle knuckle
-    return math.hypot(lm[4].x - lm[8].x, lm[4].y - lm[8].y) / max(hand, 1e-6)
+    return math.hypot(lm[4].x - lm[tip].x, lm[4].y - lm[tip].y) / max(hand, 1e-6)
+
+
+def hand_angle(lm):
+    """Image-plane heading (degrees) of the wrist -> middle-knuckle vector."""
+    return math.degrees(math.atan2(lm[9].y - lm[0].y, lm[9].x - lm[0].x))
+
+
+def angle_step(prev, cur):
+    """Signed smallest rotation from prev to cur, seam-safe (-180..180]."""
+    return (cur - prev + 180) % 360 - 180
+
+
+def toggle_mic():
+    """Flip the default microphone's mute; return True if now muted."""
+    from comtypes import CLSCTX_ALL
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+    vol = ctypes.cast(AudioUtilities.GetMicrophone().Activate(
+        IAudioEndpointVolume._iid_, CLSCTX_ALL, None),
+        ctypes.POINTER(IAudioEndpointVolume))
+    muted = not vol.GetMute()
+    vol.SetMute(muted, None)
+    return muted
+
+
+def cover_step(start, done, covered, now):
+    """Webcam-cover tracker. Returns (start, done, fire): fire goes True
+    exactly once per continuous cover that has lasted COVER_TIME."""
+    if not covered:
+        return None, False, False
+    if start is None:
+        return now, done, False
+    if not done and now - start > COVER_TIME:
+        return start, True, True
+    return start, done, False
+
+
+def pinch_fsm(mode, streak, ri, rm):
+    """One pinch gesture at a time, picked by which tip is nearest the thumb.
+
+    Curling the middle finger drags the index along with it, so both ratios
+    can be under PINCH_ON at once — nearest wins, but only after PINCH_FRAMES
+    consecutive frames, because the index tip often passes closest while a
+    middle pinch is still forming. PINCH_OFF releases (hysteresis). Returns
+    (mode, streak): mode in (None, "scroll", "vol"); streak is the signed
+    run length of the current candidate (+ = index/scroll, - = middle/vol).
+    """
+    if mode == "scroll":
+        return (None if ri > PINCH_OFF else mode), 0
+    if mode == "vol":
+        return (None if rm > PINCH_OFF else mode), 0
+    if min(ri, rm) >= PINCH_ON:
+        return None, 0
+    s = 1 if ri <= rm else -1
+    streak = streak + s if s * streak > 0 else s
+    if abs(streak) >= PINCH_FRAMES:
+        return ("scroll" if s > 0 else "vol"), 0
+    return None, streak
 
 
 def scroll_rate(offset):
@@ -177,32 +247,60 @@ def main():
     anchor_y = None
     smooth_y = None
     prev_t = None
-    pinching = False
+    mode = None  # None / "scroll" / "vol" — the currently latched pinch gesture
+    streak = 0
     acc = 0.0  # fractional wheel units carried between frames
+    vol_angle = None
+    vol_acc = 0.0  # accumulated twist (degrees) not yet paid out as volume ticks
     trail = deque()  # recent (t, motion-centroid x, y) samples for sweep detection
+    last_motion = time.time()
     last_swipe = 0.0
     last_step = 0
     prev_small = None
+    idle = False
+    cover_start = None
+    mic_done = True  # pre-"fired": a launch in a dark room must not mute the mic
     try:
         while True:
+            if idle:
+                time.sleep(0.45)  # ~2 fps is plenty for spotting wake motion
             ok, frame = cap.read()
             if not ok:
                 break
             now = time.time()
-            result = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            if result.multi_hand_landmarks:
+            idle = now - last_motion > IDLE_AFTER
+            # Standby: skip MediaPipe (the CPU hog) and poll slowly; the cheap
+            # frame-diff below keeps watching and any motion wakes us next frame.
+            # ponytail: a sweep from cold standby may need a second try (first one wakes it)
+            result = None if idle else hands.process(
+                cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            ri = rm = 9.9
+            if result and result.multi_hand_landmarks:
                 lm = result.multi_hand_landmarks[0].landmark
-                pinching = pinch_ratio(lm) < (PINCH_OFF if pinching else PINCH_ON)
+                ri, rm = pinch_ratio(lm), pinch_ratio(lm, 12)
+                mode, streak = pinch_fsm(mode, streak, ri, rm)
             else:
-                pinching = False
+                mode, streak = None, 0
+            pinching = mode == "scroll"
+            vol_pinch = mode == "vol"
             # Sweep detection: centroid of changed pixels between consecutive
             # (downscaled) frames. Works at any hand speed — blur only makes
             # the diff stronger — and needs no landmark tracking at all.
             small = cv2.cvtColor(cv2.resize(frame, (80, 45)), cv2.COLOR_BGR2GRAY)
+            lum = small.mean()
+            # Covering the lens blacks the frame out; hold it to toggle the mic.
+            # ponytail: a genuinely dark room reads as covered — add a "was
+            # recently bright" check if that ever bites
+            cover_start, mic_done, fire = cover_step(cover_start, mic_done,
+                                                     lum < COVER_DARK, now)
+            if fire:
+                winsound.Beep(250 if toggle_mic() else 900, 180)
             frac = dx = dy = 0.0
             if prev_small is not None:
                 moving = cv2.absdiff(small, prev_small) > MOTION_PX
                 frac = moving.mean()
+                if frac > MOTION_MIN:  # any motion (even a scene change) ends standby
+                    last_motion = now
                 if MOTION_MIN < frac < MOTION_MAX:
                     ys, xs = moving.nonzero()
                     dx, dy = update_trail(trail, now, xs.mean() / moving.shape[1],
@@ -219,6 +317,7 @@ def main():
                         anchor_y = None  # a sweep is not a scroll: drop any anchor
             prev_small = small
             if pinching:
+                last_motion = now  # a held pinch is motionless; don't standby mid-scroll
                 y = lm[0].y  # wrist: steadier than fingertips
                 if anchor_y is None:
                     anchor_y = smooth_y = y  # pinch start = neutral point
@@ -232,11 +331,30 @@ def main():
             else:
                 anchor_y = None
                 acc = 0.0
+            if vol_pinch:
+                last_motion = now  # a slow twist barely moves pixels; don't standby
+                a = hand_angle(lm)
+                if vol_angle is not None:
+                    # Unmirrored cam: user-clockwise = image angle decreasing
+                    vol_acc += angle_step(vol_angle, a)
+                    while abs(vol_acc) >= VOL_STEP:
+                        vk = VK_VOL_UP if vol_acc < 0 else VK_VOL_DOWN
+                        key(vk)
+                        key(vk, up=True)
+                        vol_acc -= math.copysign(VOL_STEP, vol_acc)
+                vol_angle = a
+            else:
+                vol_angle = None
+                vol_acc = 0.0
             if debug:
                 cv2.putText(frame,
-                            f"hand {'Y' if result.multi_hand_landmarks else '-'}"
-                            f"  pinch {int(pinching)}  mot {frac:.2f}  dx {dx:+.2f}",
+                            f"hand {'Y' if result and result.multi_hand_landmarks else '-'}"
+                            f"  ri {ri:.2f}  rm {rm:.2f}  mode {mode or '-'}",
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(frame,
+                            f"mot {frac:.2f}  dx {dx:+.2f}  lum {lum:.0f}"
+                            f"  idle {int(idle)}",
+                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.imshow("pinch_scroll debug", frame)
                 cv2.waitKey(1)
     except KeyboardInterrupt:
@@ -268,6 +386,40 @@ if __name__ == "__main__":
     far = hand(1.0); far[4] = P(0.9, 0)
     assert pinch_ratio(far) > PINCH_OFF
 
+    # self-check: volume pinch (thumb+middle) reads independently of the index
+    knob = hand(1.0)
+    knob[8], knob[12] = P(0.9, 0), P(0.1, 0)  # index extended, middle on thumb
+    assert pinch_ratio(knob, 12) < PINCH_ON < PINCH_OFF < pinch_ratio(knob)
+
+    # self-check: middle pinch drags the index under PINCH_ON too — the
+    # nearest tip must still win, and only after PINCH_FRAMES steady frames
+    m, s = None, 0
+    for _ in range(PINCH_FRAMES - 1):
+        m, s = pinch_fsm(m, s, 0.30, 0.10)  # both "pinched", middle nearer
+        assert m is None                    # not latched yet
+    m, s = pinch_fsm(m, s, 0.30, 0.10)
+    assert m == "vol"
+    m, s = pinch_fsm(m, s, 0.05, 0.40)      # index sneaks nearer: latch holds
+    assert m == "vol"
+    m, s = pinch_fsm(m, s, 0.05, 0.60)      # middle past PINCH_OFF: released
+    assert m is None
+    m, s = pinch_fsm(m, s, 0.30, 0.90)      # index flicker...
+    m, s = pinch_fsm(m, s, 0.90, 0.20)      # ...resets the middle streak
+    m, s = pinch_fsm(m, s, 0.90, 0.20)
+    assert m is None
+    m, s = pinch_fsm(m, s, 0.90, 0.20)
+    assert m == "vol"
+
+    # self-check: twist direction and seam-safe angle deltas
+    assert angle_step(175, -175) == 10    # crossing the +/-180 seam
+    assert angle_step(-175, 175) == -10
+    assert angle_step(10, 5) == -5
+    up = hand(1.0)                        # hand pointing up: wrist below knuckle
+    up[0], up[9] = P(0.5, 0.5), P(0.5, 0.3)
+    cw = hand(1.0)                        # user twists clockwise: knuckle drifts
+    cw[0], cw[9] = P(0.5, 0.5), P(0.4, 0.3)  # image-left (unmirrored camera)
+    assert angle_step(hand_angle(up), hand_angle(cw)) < 0  # negative = volume up
+
     # self-check: fast sweep crosses SWIPE_DIST inside the window, slow drift doesn't
     fast = deque()
     assert any(abs(update_trail(fast, t / 30, 0.2 + t / 30 * 2.5, 0.5)[0]) > SWIPE_DIST
@@ -277,10 +429,25 @@ if __name__ == "__main__":
                    for t in range(60))       # repositioning-speed drift stays under
     assert len(slow) <= SWIPE_TIME * 30 + 1  # old samples really get pruned
 
+    # self-check: mic toggles once per sustained cover; dark launch doesn't fire
+    s, d, f = cover_step(None, False, True, 10.0)   # cover begins
+    assert not f
+    s, d, f = cover_step(s, d, True, 10.5)          # too brief yet
+    assert not f
+    s, d, f = cover_step(s, d, True, 11.0)
+    assert f and d                                  # fires, exactly once
+    s, d, f = cover_step(s, d, True, 12.0)
+    assert not f                                    # holding doesn't refire
+    s, d, f = cover_step(s, d, False, 12.5)
+    assert (s, d) == (None, False)                  # uncover re-arms
+    s, d, f = cover_step(None, True, True, 0.0)     # launched in a dark room
+    s, d, f = cover_step(s, d, True, 9.0)
+    assert not f                                    # must see light first
+
     # self-check: rightward sweep = image x decreasing, and it reads as horizontal
     r = deque()
-    update_trail(r, 0, 0.8, 0.50)
-    dx, dy = update_trail(r, 0.1, 0.4, 0.45)
+    update_trail(r, 0, 0.85, 0.50)
+    dx, dy = update_trail(r, 0.1, 0.35, 0.45)
     assert dx < -SWIPE_DIST and abs(dx) > 2 * abs(dy)  # -> switch_window(+1)
 
     # self-check: the window ring is non-empty and stable across two scans
