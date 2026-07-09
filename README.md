@@ -13,7 +13,7 @@ No need to reposition your hand; to keep scrolling, just keep holding the offset
 ## Features
 
 - **Joystick-style scrolling**: Effortlessly scroll long documents without repetitive gestures.
-- **Sweep to switch windows**: Sweep an open (unpinched) hand quickly sideways to open the Alt+Tab switcher. Each sweep steps it (right = forward, left = back), a short beep confirms each step, and pausing ~1 second lands on the selected window.
+- **Sweep to switch apps**: Sweep a hand quickly sideways to switch windows. Open apps form a fixed ring (no Alt+Tab recency reshuffling): sweep right = next app, sweep left = previous app, switched instantly. A short beep confirms each sweep.
 - **Headless and lightweight**: Runs silently in the background without opening any distracting windows.
 - **Toggle to Stop**: Run the application once to start it. Run it again to gracefully stop the existing instance.
 - **Audible Cues**: Emits a high-pitched beep when started and a low-pitched beep when stopped.
@@ -60,8 +60,13 @@ DEADZONE = 0.02     # offsets smaller than this don't scroll (rest zone around a
 SMOOTH = 0.5        # 0..1, higher = snappier but jitterier position tracking
 PINCH_ON = 0.35     # pinch detection threshold
 PINCH_OFF = 0.55    # pinch release threshold (hysteresis)
-SWIPE_DIST = 0.35   # fraction of frame width a sweep must cover
-SWIPE_TIME = 0.4    # seconds the sweep must fit within
+SWIPE_DIST = 0.25   # fraction of frame width a sweep must cover
+SWIPE_TIME = 0.6    # seconds the sweep must fit within
 SWIPE_COOLDOWN = 0.8  # seconds before another sweep can fire
-ALT_HOLD = 1.2      # seconds of pause before the switcher commits
 ```
+
+### Debugging
+
+Run `python app.py --debug` to get a live camera preview with the tracker state
+(hand detected, pinch state, sweep travel) overlaid — useful for tuning the
+thresholds above.

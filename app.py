@@ -5,9 +5,9 @@ scroll down, above it to scroll up — the further from neutral, the faster
 (accelerating curve). Release the pinch to stop. No need to reposition: to keep
 scrolling, just keep holding the offset.
 
-Sweep an open (unpinched) hand quickly sideways to switch windows: the Alt+Tab
-switcher opens and each sweep steps it (right sweep = forward, left = back).
-Pause to land on the selected window.
+Sweep a hand quickly sideways to switch app windows. Open apps form a fixed
+ring (stable for as long as they stay open — no Alt+Tab recency reshuffling):
+sweep right = next app, sweep left = previous app, instantly.
 
 Runs headless. Launching it again stops the running instance (high beep = started,
 low beep = stopped).
@@ -38,30 +38,78 @@ PINCH_ON = 0.35
 PINCH_OFF = 0.55
 # Sweep = unpinched wrist travelling SWIPE_DIST (fraction of frame width)
 # within SWIPE_TIME seconds. Cooldown so one sweep fires one switcher step.
-SWIPE_DIST = 0.35
-SWIPE_TIME = 0.4
+SWIPE_DIST = 0.25  # tracker drops blurred hands mid-sweep, so full travel is rare
+SWIPE_TIME = 0.6   # wide enough to bridge a tracking dropout + re-detection
 SWIPE_COOLDOWN = 0.8
-ALT_HOLD = 1.2  # Alt stays down this long after a sweep; pausing commits the switch
 
-VK_ALT, VK_TAB, VK_SHIFT = 0x12, 0x09, 0x10
+VK_ALT = 0x12
+
+user32 = ctypes.windll.user32
+# HWNDs must round-trip as pointers, not default 32-bit ints
+user32.GetForegroundWindow.restype = ctypes.c_void_p
+user32.GetAncestor.restype = ctypes.c_void_p
+user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+user32.GetWindow.restype = ctypes.c_void_p
+user32.GetWindow.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+user32.GetWindowTextLengthW.argtypes = [ctypes.c_void_p]
+user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+user32.IsIconic.argtypes = [ctypes.c_void_p]
+user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+_EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+user32.EnumWindows.argtypes = [_EnumProc, ctypes.c_void_p]
 
 
 def scroll(amount):
-    ctypes.windll.user32.mouse_event(0x0800, 0, 0, int(amount), 0)  # MOUSEEVENTF_WHEEL
+    user32.mouse_event(0x0800, 0, 0, int(amount), 0)  # MOUSEEVENTF_WHEEL
 
 
 def key(vk, up=False):
-    ctypes.windll.user32.keybd_event(vk, 0, 2 * up, 0)  # 2 = KEYEVENTF_KEYUP
+    user32.keybd_event(vk, 0, 2 * up, 0)  # 2 = KEYEVENTF_KEYUP
 
 
-def tab_step(forward):
-    """One step in the Alt+Tab switcher (Alt must already be held down)."""
-    if not forward:
-        key(VK_SHIFT)
-    key(VK_TAB)
-    key(VK_TAB, up=True)
-    if not forward:
-        key(VK_SHIFT, up=True)
+def app_windows():
+    """Alt-Tab-eligible top-level windows, in a stable (hwnd) order."""
+    GWL_EXSTYLE, WS_EX_TOOLWINDOW, WS_EX_APPWINDOW = -20, 0x80, 0x40000
+    wins = []
+
+    @_EnumProc
+    def cb(hwnd, _):
+        pid = ctypes.c_uint()  # skip our own windows (the --debug preview)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value == os.getpid():
+            return True
+        ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        cloaked = ctypes.c_int(0)  # invisible UWP/virtual-desktop ghosts
+        ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            ctypes.c_void_p(hwnd), 14, ctypes.byref(cloaked), 4)  # DWMWA_CLOAKED
+        if (user32.IsWindowVisible(hwnd)
+                and not user32.GetWindow(hwnd, 4)  # GW_OWNER: skip owned dialogs
+                and (not ex & WS_EX_TOOLWINDOW or ex & WS_EX_APPWINDOW)
+                and user32.GetWindowTextLengthW(hwnd)
+                and not cloaked.value):
+            wins.append(hwnd)
+        return True
+
+    user32.EnumWindows(cb, None)
+    return sorted(wins)  # hwnd order: arbitrary but stable while windows live
+
+
+def switch_window(step):
+    """Activate the current app's neighbour (step = +1/-1) in the window ring."""
+    wins = app_windows()
+    if not wins:
+        return
+    cur = user32.GetAncestor(user32.GetForegroundWindow(), 2)  # GA_ROOT
+    i = wins.index(cur) if cur in wins else 0
+    target = wins[(i + step) % len(wins)]
+    if user32.IsIconic(target):
+        user32.ShowWindow(target, 9)  # SW_RESTORE
+    key(VK_ALT)  # an injected keypress lets a background process take foreground
+    user32.SetForegroundWindow(target)
+    key(VK_ALT, up=True)
 
 
 def update_trail(trail, t, x):
@@ -108,9 +156,9 @@ def main():
     with open(PIDFILE, "w") as f:
         f.write(str(os.getpid()))
     hands = mp.solutions.hands.Hands(max_num_hands=1,
-                                     model_complexity=1,
+                                     model_complexity=0,  # lighter = faster = re-locks onto fast hands sooner
                                      min_detection_confidence=0.4,  # catch blurred fast hands
-                                     min_tracking_confidence=0.3)
+                                     min_tracking_confidence=0.2)
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # MSMF backend takes ~16s to open here
     if not cap.isOpened():
         raise SystemExit("No camera found.")
@@ -125,7 +173,6 @@ def main():
     acc = 0.0  # fractional wheel units carried between frames
     trail = deque()  # recent (t, wrist x) samples for sweep detection
     last_swipe = 0.0
-    alt_held = False
     try:
         while True:
             ok, frame = cap.read()
@@ -143,10 +190,7 @@ def main():
                 # survives; time-based pruning discards stale samples.
                 dx = update_trail(trail, now, lm[0].x)
                 if abs(dx) > SWIPE_DIST and now - last_swipe > SWIPE_COOLDOWN:
-                    if not alt_held:
-                        key(VK_ALT)  # opens the switcher UI
-                        alt_held = True
-                    tab_step(dx < 0)  # raw webcam is unmirrored: user-right = -x
+                    switch_window(1 if dx < 0 else -1)  # unmirrored cam: user-right = -x
                     winsound.Beep(1200, 30)  # click: sweep registered
                     last_swipe = now
                     trail.clear()
@@ -154,9 +198,6 @@ def main():
                     pinching = False
             else:
                 pinching = False
-            if alt_held and now - last_swipe > ALT_HOLD:
-                key(VK_ALT, up=True)  # commit the selected window
-                alt_held = False
             if pinching:
                 y = lm[0].y  # wrist: steadier than fingertips
                 if anchor_y is None:
@@ -174,16 +215,13 @@ def main():
             if debug:
                 cv2.putText(frame,
                             f"hand {'Y' if result.multi_hand_landmarks else '-'}"
-                            f"  pinch {int(pinching)}  dx {dx:+.2f}"
-                            f"  alt {int(alt_held)}",
+                            f"  pinch {int(pinching)}  dx {dx:+.2f}",
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.imshow("pinch_scroll debug", frame)
                 cv2.waitKey(1)
     except KeyboardInterrupt:
         pass
     finally:
-        if alt_held:
-            key(VK_ALT, up=True)  # toggle-kill skips this; 1.2s window, tiny risk
         cap.release()
         try:
             os.remove(PIDFILE)  # killed-via-toggle leaves this to the tasklist check
@@ -215,12 +253,16 @@ if __name__ == "__main__":
     assert any(abs(update_trail(fast, t / 30, 0.2 + t / 30 * 2.5)) > SWIPE_DIST
                for t in range(14))           # 2.5 frame-widths/sec
     slow = deque()
-    assert not any(abs(update_trail(slow, t / 30, 0.2 + t / 30 * 0.5)) > SWIPE_DIST
-                   for t in range(60))       # same distance, 5x slower
+    assert not any(abs(update_trail(slow, t / 30, 0.2 + t / 30 * 0.3)) > SWIPE_DIST
+                   for t in range(60))       # repositioning-speed drift stays under
     assert len(slow) <= SWIPE_TIME * 30 + 1  # old samples really get pruned
 
     # self-check: sign convention — user sweeping right = image x decreasing
     r = deque()
     update_trail(r, 0, 0.8)
-    assert update_trail(r, 0.1, 0.3) < 0     # negative dx -> tab_step(forward=True)
+    assert update_trail(r, 0.1, 0.3) < 0     # negative dx -> switch_window(+1)
+
+    # self-check: the window ring is non-empty and stable across two scans
+    ring = app_windows()
+    assert ring and ring == app_windows() == sorted(ring)
     main()
