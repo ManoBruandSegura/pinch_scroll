@@ -5,6 +5,8 @@ scroll down, above it to scroll up — the further from neutral, the faster
 (accelerating curve). Release the pinch to stop. No need to reposition: to keep
 scrolling, just keep holding the offset.
 
+Sweep an open (unpinched) hand quickly sideways to switch windows (Alt+Tab).
+
 Runs headless. Launching it again stops the running instance (high beep = started,
 low beep = stopped).
 """
@@ -16,6 +18,7 @@ import subprocess
 import tempfile
 import time
 import winsound
+from collections import deque
 
 PIDFILE = os.path.join(tempfile.gettempdir(), "pinch_scroll.pid")
 
@@ -30,10 +33,29 @@ SMOOTH = 0.5        # 0..1, higher = snappier but jitterier position tracking
 # frame doesn't drop the pinch.
 PINCH_ON = 0.35
 PINCH_OFF = 0.55
+# Sweep = unpinched wrist travelling SWIPE_DIST (fraction of frame width)
+# within SWIPE_TIME seconds. Cooldown so one sweep fires one Alt+Tab.
+SWIPE_DIST = 0.35
+SWIPE_TIME = 0.25
+SWIPE_COOLDOWN = 0.8
 
 
 def scroll(amount):
     ctypes.windll.user32.mouse_event(0x0800, 0, 0, int(amount), 0)  # MOUSEEVENTF_WHEEL
+
+
+def alt_tab():
+    """Quick Alt+Tab tap: switches to the previous window."""
+    for vk, flag in ((0x12, 0), (0x09, 0), (0x09, 2), (0x12, 2)):  # alt/tab down, up
+        ctypes.windll.user32.keybd_event(vk, 0, flag, 0)
+
+
+def update_trail(trail, t, x):
+    """Add a wrist sample, drop ones older than SWIPE_TIME, return travel."""
+    trail.append((t, x))
+    while t - trail[0][0] > SWIPE_TIME:
+        trail.popleft()
+    return abs(x - trail[0][1])
 
 
 def pinch_ratio(lm):
@@ -86,6 +108,8 @@ def main():
     prev_t = None
     pinching = False
     acc = 0.0  # fractional wheel units carried between frames
+    trail = deque()  # recent (t, wrist x) samples for sweep detection
+    last_swipe = 0.0
     try:
         while True:
             ok, frame = cap.read()
@@ -99,6 +123,7 @@ def main():
             else:
                 pinching = False
             if pinching:
+                trail.clear()  # scroll mode: hand motion is not a sweep
                 y = lm[0].y  # wrist: steadier than fingertips
                 if anchor_y is None:
                     anchor_y = smooth_y = y  # pinch start = neutral point
@@ -112,6 +137,14 @@ def main():
             else:
                 anchor_y = None
                 acc = 0.0
+                if result.multi_hand_landmarks:
+                    if (update_trail(trail, now, lm[0].x) > SWIPE_DIST
+                            and now - last_swipe > SWIPE_COOLDOWN):
+                        alt_tab()
+                        last_swipe = now
+                        trail.clear()
+                else:
+                    trail.clear()  # hand lost: don't bridge across reappearance
     except KeyboardInterrupt:
         pass
     finally:
@@ -140,4 +173,13 @@ if __name__ == "__main__":
     assert pinch_ratio(hand(1.0)) == pinch_ratio(hand(0.3)) < PINCH_ON
     far = hand(1.0); far[4] = P(0.9, 0)
     assert pinch_ratio(far) > PINCH_OFF
+
+    # self-check: fast sweep crosses SWIPE_DIST inside the window, slow drift doesn't
+    fast = deque()
+    assert any(update_trail(fast, t / 30, 0.2 + t / 30 * 2.5) > SWIPE_DIST
+               for t in range(8))            # 2.5 frame-widths/sec for ~0.25s
+    slow = deque()
+    assert not any(update_trail(slow, t / 30, 0.2 + t / 30 * 0.5) > SWIPE_DIST
+                   for t in range(60))       # same 1s distance, spread over 2s
+    assert len(slow) <= SWIPE_TIME * 30 + 1  # old samples really get pruned
     main()
