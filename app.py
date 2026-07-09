@@ -1,0 +1,145 @@
+"""Pinch (thumb + index) to scroll the PC, joystick-style.
+
+The spot where you pinch becomes the neutral point. Hold your hand below it to
+scroll down, above it to scroll up — the further from neutral, the faster
+(accelerating curve). Release the pinch to stop. No need to reposition: to keep
+scrolling, just keep holding the offset.
+
+Runs headless. Launching it again stops the running instance (high beep = started,
+low beep = stopped).
+"""
+import ctypes
+import math
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import winsound
+
+import cv2
+import mediapipe as mp
+
+PIDFILE = os.path.join(tempfile.gettempdir(), "pinch_scroll.pid")
+
+# --- tuning knobs ---
+SCROLL_SPEED = 800  # wheel units/sec when the hand is OFFSET_REF from the anchor
+OFFSET_REF = 0.15   # offset (fraction of frame height) that gets SCROLL_SPEED
+ACCEL = 1.7         # 1 = linear, higher = far offsets scroll disproportionately faster
+DEADZONE = 0.02     # offsets smaller than this don't scroll (rest zone around anchor)
+SMOOTH = 0.5        # 0..1, higher = snappier but jitterier position tracking
+# Pinch = thumb-tip/index-tip gap relative to hand size (works at any distance
+# from the camera). Hysteresis: easier to hold than to start, so one noisy
+# frame doesn't drop the pinch.
+PINCH_ON = 0.35
+PINCH_OFF = 0.55
+
+
+def scroll(amount):
+    ctypes.windll.user32.mouse_event(0x0800, 0, 0, int(amount), 0)  # MOUSEEVENTF_WHEEL
+
+
+def pinch_ratio(lm):
+    hand = math.hypot(lm[0].x - lm[9].x, lm[0].y - lm[9].y)  # wrist -> middle knuckle
+    return math.hypot(lm[4].x - lm[8].x, lm[4].y - lm[8].y) / max(hand, 1e-6)
+
+
+def scroll_rate(offset):
+    """Wheel units/sec for a hand held `offset` above (+) or below (-) the anchor."""
+    if abs(offset) < DEADZONE:
+        return 0.0
+    return math.copysign(SCROLL_SPEED * (abs(offset) / OFFSET_REF) ** ACCEL, offset)
+
+
+def stop_existing():
+    """If another instance is running, kill it and return True (toggle behavior)."""
+    try:
+        pid = int(open(PIDFILE).read())
+    except (OSError, ValueError):
+        return False
+    out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
+                         capture_output=True, text=True).stdout
+    if "python" not in out.lower():
+        return False  # stale pidfile from a crashed/killed run
+    os.kill(pid, signal.SIGTERM)
+    os.remove(PIDFILE)
+    return True
+
+
+def main():
+    if stop_existing():
+        winsound.Beep(400, 200)  # low beep: stopped
+        return
+    with open(PIDFILE, "w") as f:
+        f.write(str(os.getpid()))
+    hands = mp.solutions.hands.Hands(max_num_hands=1,
+                                     model_complexity=1,
+                                     min_detection_confidence=0.6,
+                                     min_tracking_confidence=0.3)
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        raise SystemExit("No camera found.")
+
+    print("Pinch to set an anchor, hold hand above/below it to scroll. Ctrl+C to quit.")
+    winsound.Beep(800, 200)  # high beep: started
+    anchor_y = None
+    smooth_y = None
+    prev_t = None
+    pinching = False
+    acc = 0.0  # fractional wheel units carried between frames
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            now = time.time()
+            result = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            if result.multi_hand_landmarks:
+                lm = result.multi_hand_landmarks[0].landmark
+                pinching = pinch_ratio(lm) < (PINCH_OFF if pinching else PINCH_ON)
+            else:
+                pinching = False
+            if pinching:
+                y = lm[0].y  # wrist: steadier than fingertips
+                if anchor_y is None:
+                    anchor_y = smooth_y = y  # pinch start = neutral point
+                else:
+                    smooth_y += SMOOTH * (y - smooth_y)  # EMA against jitter
+                    acc += scroll_rate(anchor_y - smooth_y) * (now - prev_t)
+                    if abs(acc) >= 1:
+                        scroll(int(acc))
+                        acc -= int(acc)
+                prev_t = now
+            else:
+                anchor_y = None
+                acc = 0.0
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cap.release()
+        try:
+            os.remove(PIDFILE)  # killed-via-toggle leaves this to the tasklist check
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    # self-check: direction, deadzone, acceleration curve
+    assert scroll_rate(0.1) > 0       # hand above anchor -> scroll up
+    assert scroll_rate(-0.1) < 0      # hand below anchor -> scroll down
+    assert scroll_rate(0.01) == 0.0   # inside rest zone -> no scroll
+    assert scroll_rate(0.3) > 2 * scroll_rate(0.15)  # 2x offset -> more than 2x speed
+
+    # self-check: pinch ratio is scale-invariant
+    class P:
+        def __init__(self, x, y): self.x, self.y = x, y
+    def hand(scale):
+        lm = [P(0, 0)] * 21
+        lm[0], lm[9] = P(0, 0), P(0, scale)          # hand size
+        lm[4], lm[8] = P(0, 0), P(0.1 * scale, 0)    # small pinch gap
+        return lm
+    assert pinch_ratio(hand(1.0)) == pinch_ratio(hand(0.3)) < PINCH_ON
+    far = hand(1.0); far[4] = P(0.9, 0)
+    assert pinch_ratio(far) > PINCH_OFF
+    main()
