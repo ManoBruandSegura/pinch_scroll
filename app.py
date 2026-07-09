@@ -17,6 +17,7 @@ import math
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import winsound
@@ -108,12 +109,13 @@ def main():
         f.write(str(os.getpid()))
     hands = mp.solutions.hands.Hands(max_num_hands=1,
                                      model_complexity=1,
-                                     min_detection_confidence=0.6,
+                                     min_detection_confidence=0.4,  # catch blurred fast hands
                                      min_tracking_confidence=0.3)
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # MSMF backend takes ~16s to open here
     if not cap.isOpened():
         raise SystemExit("No camera found.")
 
+    debug = "--debug" in sys.argv  # shows the camera feed + tracker state
     print("Pinch to set an anchor, hold hand above/below it to scroll. Ctrl+C to quit.")
     winsound.Beep(800, 200)  # high beep: started
     anchor_y = None
@@ -131,16 +133,31 @@ def main():
                 break
             now = time.time()
             result = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            dx = 0.0
             if result.multi_hand_landmarks:
                 lm = result.multi_hand_landmarks[0].landmark
                 pinching = pinch_ratio(lm) < (PINCH_OFF if pinching else PINCH_ON)
+                # Sweep tracking runs even while "pinching": a relaxed swiping
+                # hand often reads as a pinch (thumb rests near the index).
+                # If the hand drops out mid-sweep (motion blur), the trail
+                # survives; time-based pruning discards stale samples.
+                dx = update_trail(trail, now, lm[0].x)
+                if abs(dx) > SWIPE_DIST and now - last_swipe > SWIPE_COOLDOWN:
+                    if not alt_held:
+                        key(VK_ALT)  # opens the switcher UI
+                        alt_held = True
+                    tab_step(dx < 0)  # raw webcam is unmirrored: user-right = -x
+                    winsound.Beep(1200, 30)  # click: sweep registered
+                    last_swipe = now
+                    trail.clear()
+                    anchor_y = None  # a sweep is not a scroll: drop any anchor
+                    pinching = False
             else:
                 pinching = False
-            if alt_held and (pinching or now - last_swipe > ALT_HOLD):
+            if alt_held and now - last_swipe > ALT_HOLD:
                 key(VK_ALT, up=True)  # commit the selected window
                 alt_held = False
             if pinching:
-                trail.clear()  # scroll mode: hand motion is not a sweep
                 y = lm[0].y  # wrist: steadier than fingertips
                 if anchor_y is None:
                     anchor_y = smooth_y = y  # pinch start = neutral point
@@ -154,18 +171,14 @@ def main():
             else:
                 anchor_y = None
                 acc = 0.0
-                if result.multi_hand_landmarks:
-                    dx = update_trail(trail, now, lm[0].x)
-                    if abs(dx) > SWIPE_DIST and now - last_swipe > SWIPE_COOLDOWN:
-                        if not alt_held:
-                            key(VK_ALT)  # opens the switcher UI
-                            alt_held = True
-                        tab_step(dx < 0)  # raw webcam is unmirrored: user-right = -x
-                        winsound.Beep(1200, 30)  # click: sweep registered
-                        last_swipe = now
-                        trail.clear()
-                # hand lost = usually motion blur mid-sweep; keep the trail,
-                # time-based pruning discards it if the hand stays gone
+            if debug:
+                cv2.putText(frame,
+                            f"hand {'Y' if result.multi_hand_landmarks else '-'}"
+                            f"  pinch {int(pinching)}  dx {dx:+.2f}"
+                            f"  alt {int(alt_held)}",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.imshow("pinch_scroll debug", frame)
+                cv2.waitKey(1)
     except KeyboardInterrupt:
         pass
     finally:
