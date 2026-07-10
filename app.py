@@ -294,8 +294,10 @@ def stop_existing():
     except (OSError, ValueError):
         return False
     out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
-                         capture_output=True, text=True).stdout
-    if "python" not in out.lower():
+                         capture_output=True, text=True).stdout.lower()
+    # script runs show as python*.exe, the PyInstaller build as its own name
+    me = os.path.basename(sys.executable).lower()
+    if "python" not in out and me not in out:
         return False  # stale pidfile from a crashed/killed run
     os.kill(pid, signal.SIGTERM)
     os.remove(PIDFILE)

@@ -6,3 +6,8 @@ mobile/build/
 mobile/app/build/
 mobile/local.properties
 mobile/.idea/
+
+# PyInstaller
+build/
+dist/
+*.spec

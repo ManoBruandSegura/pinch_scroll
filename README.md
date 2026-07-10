@@ -84,3 +84,16 @@ FIST_TIME = 0.4     # seconds a closed fist must be held to toggle play/pause
 Run `python app.py --debug` to get a live camera preview with the tracker state
 (hand detected, pinch state, sweep travel) overlaid — useful for tuning the
 thresholds above.
+
+### Standalone exe
+
+Build a double-clickable app (no Python needed on the target machine):
+
+```
+py -3.11 -m pip install pyinstaller
+py -3.11 -m PyInstaller --onedir --windowed --name pinch_scroll --collect-all mediapipe --noconfirm app.py
+```
+
+The app lands in `dist/pinch_scroll/pinch_scroll.exe` — launching it again
+toggles it off, same as the script. (`--collect-all mediapipe` bundles the
+hand/face model files PyInstaller's analysis misses.)
