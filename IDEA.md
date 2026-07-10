@@ -1,2 +1,13 @@
 A way to remotely scroll using gestures
-- Mute toggle: Mute/unmute the system microphone if I cover the webcam with my hand.
+- Mute toggle: Mute/unmute the system microphone if I cover the webcam with my hand. (done)
+- Horizontal Scrolling: Map left/right movement (while pinched) to horizontal scrolling.
+- Zooming: Add a modifier gesture for zooming (e.g., pinch with both hands or hold up another finger).
+- Virtual Desktop Switching: Swipe with an open palm to switch between Windows Virtual Desktops.
+- Volume Dial: Detect a rotation gesture or horizontal pinch-drag to adjust system volume. (done: thumb+middle pinch, twist like a knob)
+- Play/Pause Media: Use an open palm or closed fist gesture to toggle media playback.
+- Full "Air Mouse": Move the cursor with the index finger, pinch to left-click/drag, two-finger pinch to right-click.
+- System Tray Icon: A GUI (like pystray) to adjust sensitivity or toggle features without restarting the app or editing code.
+- Auto-Sleep / Wake Gesture: Enter a low-FPS mode if no hands are seen to save CPU, wake up with a wave gesture. (done: idle standby after 30s without motion, any motion wakes it)
+- Custom Gesture Mapping: Allow users to map specific hand gestures to custom keyboard shortcuts.
+- Face-Presence Auto-Lock: Lock the PC (LockWorkStation) when no face has been seen for N minutes — one extra MediaPipe face-detection pass on frames we already capture.
+- Phone as Remote: Finish the Android port in mobile/ — the phone camera does the gesture detection and sends scroll/switch events to the PC over the local network, so it works where the webcam can't see.

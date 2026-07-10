@@ -14,6 +14,7 @@ No need to reposition your hand; to keep scrolling, just keep holding the offset
 
 - **Joystick-style scrolling**: Effortlessly scroll long documents without repetitive gestures.
 - **Volume knob**: Pinch your thumb and **middle** finger together and twist your hand like a knob — clockwise raises the volume, counterclockwise lowers it (Windows shows its volume overlay as feedback). The index-finger pinch still scrolls: whichever fingertip is nearest the thumb claims the gesture (after a few steady frames), so curling your middle finger — which drags the index along — can't be mistaken for a scroll pinch.
+- **Fist to play/pause**: Close your hand into a fist for a moment to send the media play/pause key (a short beep confirms). Open your hand before making another fist to fire again.
 - **Mic mute toggle**: Cover the webcam with your hand for about a second to mute the system microphone; cover it again to unmute. A low beep means muted, a high beep means live. Works even from idle standby.
 - **Sweep to switch apps**: Sweep a hand quickly sideways to switch windows. Open apps form a fixed ring (no Alt+Tab recency reshuffling): sweep right = next app, sweep left = previous app, switched instantly. A short beep confirms each sweep. Detection is motion-based, so any speed works — the faster the sweep, the stronger the signal. The quick return stroke after a sweep is deliberately ignored; to go back the other way, pause ~1.5s first.
 - **Headless and lightweight**: Runs silently in the background without opening any distracting windows.
@@ -75,6 +76,7 @@ MOTION_MAX = 0.5    # above this = lighting/scene change, ignored
 IDLE_AFTER = 30     # seconds without motion before standby (motion wakes it)
 COVER_DARK = 40     # mean gray level below this = webcam covered
 COVER_TIME = 0.8    # seconds the cover must be held to toggle the mic
+FIST_TIME = 0.4     # seconds a closed fist must be held to toggle play/pause
 ```
 
 ### Debugging

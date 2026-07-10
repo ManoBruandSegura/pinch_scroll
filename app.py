@@ -11,6 +11,8 @@ clockwise = up, counterclockwise = down.
 Cover the webcam with your hand for ~a second to mute/unmute the system
 microphone (low beep = muted, high beep = live again).
 
+Close your hand into a fist for a moment to play/pause media.
+
 Sweep a hand quickly sideways to switch app windows. Open apps form a fixed
 ring (stable for as long as they stay open — no Alt+Tab recency reshuffling):
 sweep right = next app, sweep left = previous app, instantly. Sweep detection
@@ -59,9 +61,11 @@ MOTION_MAX = 0.5   # above this = scene/lighting change, not a hand
 IDLE_AFTER = 30    # s without motion -> standby: skip hand tracking until motion wakes it
 COVER_DARK = 40    # mean gray level below this = webcam covered by a hand
 COVER_TIME = 0.8   # s the cover must be held before the mic mute toggles
+FIST_TIME = 0.4    # s a closed fist must be held to toggle play/pause
 
 VK_ALT = 0x12
 VK_VOL_UP, VK_VOL_DOWN = 0xAF, 0xAE
+VK_MEDIA_PLAY = 0xB3
 
 user32 = ctypes.windll.user32
 # HWNDs must round-trip as pointers, not default 32-bit ints
@@ -168,16 +172,23 @@ def toggle_mic():
     return muted
 
 
-def cover_step(start, done, covered, now):
-    """Webcam-cover tracker. Returns (start, done, fire): fire goes True
-    exactly once per continuous cover that has lasted COVER_TIME."""
-    if not covered:
+def hold_step(start, done, on, now, hold):
+    """Held-condition tracker. Returns (start, done, fire): fire goes True
+    exactly once per continuous stretch of `on` lasting `hold` seconds."""
+    if not on:
         return None, False, False
     if start is None:
         return now, done, False
-    if not done and now - start > COVER_TIME:
+    if not done and now - start > hold:
         return start, True, True
     return start, done, False
+
+
+def is_fist(lm):
+    """All four fingertips curled in closer to the wrist than their knuckles."""
+    def d(i):
+        return math.hypot(lm[i].x - lm[0].x, lm[i].y - lm[0].y)
+    return all(d(tip) < d(tip - 3) for tip in (8, 12, 16, 20))  # tip-3 = knuckle
 
 
 def pinch_fsm(mode, streak, ri, rm):
@@ -260,6 +271,8 @@ def main():
     idle = False
     cover_start = None
     mic_done = True  # pre-"fired": a launch in a dark room must not mute the mic
+    fist_start = None
+    fist_done = False
     try:
         while True:
             if idle:
@@ -275,10 +288,15 @@ def main():
             result = None if idle else hands.process(
                 cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             ri = rm = 9.9
+            fist = False
             if result and result.multi_hand_landmarks:
                 lm = result.multi_hand_landmarks[0].landmark
                 ri, rm = pinch_ratio(lm), pinch_ratio(lm, 12)
-                mode, streak = pinch_fsm(mode, streak, ri, rm)
+                fist = is_fist(lm)
+                if fist:  # fingers pass near the thumb while a fist closes:
+                    mode, streak = None, 0  # never read that as a pinch
+                else:
+                    mode, streak = pinch_fsm(mode, streak, ri, rm)
             else:
                 mode, streak = None, 0
             pinching = mode == "scroll"
@@ -291,10 +309,16 @@ def main():
             # Covering the lens blacks the frame out; hold it to toggle the mic.
             # ponytail: a genuinely dark room reads as covered — add a "was
             # recently bright" check if that ever bites
-            cover_start, mic_done, fire = cover_step(cover_start, mic_done,
-                                                     lum < COVER_DARK, now)
+            cover_start, mic_done, fire = hold_step(cover_start, mic_done,
+                                                    lum < COVER_DARK, now, COVER_TIME)
             if fire:
                 winsound.Beep(250 if toggle_mic() else 900, 180)
+            fist_start, fist_done, fire = hold_step(fist_start, fist_done,
+                                                    fist, now, FIST_TIME)
+            if fire:  # open the hand to re-arm; holding the fist won't refire
+                key(VK_MEDIA_PLAY)
+                key(VK_MEDIA_PLAY, up=True)
+                winsound.Beep(600, 80)
             frac = dx = dy = 0.0
             if prev_small is not None:
                 moving = cv2.absdiff(small, prev_small) > MOTION_PX
@@ -349,7 +373,8 @@ def main():
             if debug:
                 cv2.putText(frame,
                             f"hand {'Y' if result and result.multi_hand_landmarks else '-'}"
-                            f"  ri {ri:.2f}  rm {rm:.2f}  mode {mode or '-'}",
+                            f"  ri {ri:.2f}  rm {rm:.2f}  mode {mode or '-'}"
+                            f"  fist {int(fist)}",
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.putText(frame,
                             f"mot {frac:.2f}  dx {dx:+.2f}  lum {lum:.0f}"
@@ -429,20 +454,33 @@ if __name__ == "__main__":
                    for t in range(60))       # repositioning-speed drift stays under
     assert len(slow) <= SWIPE_TIME * 30 + 1  # old samples really get pruned
 
-    # self-check: mic toggles once per sustained cover; dark launch doesn't fire
-    s, d, f = cover_step(None, False, True, 10.0)   # cover begins
+    # self-check: hold fires once per sustained stretch; pre-done doesn't fire
+    T = COVER_TIME
+    s, d, f = hold_step(None, False, True, 10.0, T)  # cover begins
     assert not f
-    s, d, f = cover_step(s, d, True, 10.5)          # too brief yet
+    s, d, f = hold_step(s, d, True, 10.5, T)         # too brief yet
     assert not f
-    s, d, f = cover_step(s, d, True, 11.0)
-    assert f and d                                  # fires, exactly once
-    s, d, f = cover_step(s, d, True, 12.0)
-    assert not f                                    # holding doesn't refire
-    s, d, f = cover_step(s, d, False, 12.5)
-    assert (s, d) == (None, False)                  # uncover re-arms
-    s, d, f = cover_step(None, True, True, 0.0)     # launched in a dark room
-    s, d, f = cover_step(s, d, True, 9.0)
-    assert not f                                    # must see light first
+    s, d, f = hold_step(s, d, True, 11.0, T)
+    assert f and d                                   # fires, exactly once
+    s, d, f = hold_step(s, d, True, 12.0, T)
+    assert not f                                     # holding doesn't refire
+    s, d, f = hold_step(s, d, False, 12.5, T)
+    assert (s, d) == (None, False)                   # release re-arms
+    s, d, f = hold_step(None, True, True, 0.0, T)    # launched in a dark room
+    s, d, f = hold_step(s, d, True, 9.0, T)
+    assert not f                                     # must see light first
+
+    # self-check: fist = all four tips curled; pinch grips must not read as one
+    def pose(*curled):
+        lm = [P(0, 0)] * 21
+        for tip in (8, 12, 16, 20):
+            lm[tip - 3] = P(0.4, 0)                       # knuckle
+            lm[tip] = P(0.2, 0) if tip in curled else P(0.9, 0)
+        return lm
+    assert is_fist(pose(8, 12, 16, 20))
+    assert not is_fist(pose())              # open hand
+    assert not is_fist(pose(12))            # volume-knob grip: middle curled
+    assert not is_fist(pose(8))             # scroll pinch: index curled
 
     # self-check: rightward sweep = image x decreasing, and it reads as horizontal
     r = deque()
