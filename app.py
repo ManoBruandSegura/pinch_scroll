@@ -36,6 +36,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import winsound
 from collections import deque
@@ -306,6 +307,10 @@ def main():
         winsound.Beep(400, 200)  # low beep: stopped
         return
     import cv2  # heavy imports (~2s) deferred past the toggle check: stopping is instant
+    cam = []  # the camera takes ~1s to open: overlap it with the mediapipe import
+    opener = threading.Thread(  # DSHOW: the MSMF backend takes ~16s to open here
+        target=lambda: cam.append(cv2.VideoCapture(0, cv2.CAP_DSHOW)))
+    opener.start()
     import mediapipe as mp
     with open(PIDFILE, "w") as f:
         f.write(str(os.getpid()))
@@ -317,7 +322,8 @@ def main():
     # (pet, passer-by, chair back) must not drive the PC.
     face = mp.solutions.face_detection.FaceDetection(
         model_selection=0, min_detection_confidence=0.5)
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # MSMF backend takes ~16s to open here
+    opener.join()
+    cap = cam[0]
     if not cap.isOpened():
         raise SystemExit("No camera found.")
 
