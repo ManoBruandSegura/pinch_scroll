@@ -13,11 +13,18 @@ microphone (low beep = muted, high beep = live again).
 
 Close your hand into a fist for a moment to play/pause media.
 
+Point with your index finger (other fingers curled) to drive the mouse
+pointer — the central area of the frame maps to the whole screen. Extend your
+thumb away from the fist and fold it back in to left-click.
+
 Sweep a hand quickly sideways to switch app windows. Open apps form a fixed
 ring (stable for as long as they stay open — no Alt+Tab recency reshuffling):
 sweep right = next app, sweep left = previous app, instantly. Sweep detection
 is motion-based (frame differencing), not landmark-based: the tracker loses a
 fast hand to motion blur, but blur only makes the motion signal stronger.
+
+Gestures only work while your face is in view of the camera (with a couple of
+seconds of grace), so a stray hand with nobody at the desk moves nothing.
 
 Runs headless. Launching it again stops the running instance (high beep = started,
 low beep = stopped).
@@ -61,7 +68,27 @@ MOTION_MAX = 0.5   # above this = scene/lighting change, not a hand
 IDLE_AFTER = 30    # s without motion -> standby: skip hand tracking until motion wakes it
 COVER_DARK = 40    # mean gray level below this = webcam covered by a hand
 COVER_TIME = 0.8   # s the cover must be held before the mic mute toggles
+FACE_GRACE = 2.0   # s after the last face sighting that gestures stay armed
+FACE_EVERY = 0.3   # s between face checks (a face doesn't move fast)
 FIST_TIME = 0.4    # s a closed fist must be held to toggle play/pause
+AIR_MARGIN = 0.25       # frame-edge fraction outside the air-mouse box, sideways
+AIR_BOX_Y = (0.25, 0.6)  # fingertip y range spanning screen top..bottom: the hand
+                         # hangs below the fingertip, so pointing lower than ~0.6
+                         # pushes the hand out of frame and tracking drops it
+AIR_SMOOTH = 0.35  # 0..1 EMA for the cursor; lower = steadier but laggier
+POINT_GRACE = 0.4  # s the pointer pose survives flickered reads: the tracker
+                   # regularly drops the camera-aimed index for a frame or two
+# Click trigger = thumb tip vs thumb joint, each as distance from the pinky
+# knuckle: below THUMB_ON = thumb folded onto the fist (fire), above
+# THUMB_OFF = extended (re-arm). Ratio of the hand's own proportions, so no
+# hand-size or morphology constant is involved.
+THUMB_ON = 1.05   # measured on the actual hand: folded reads ~0.96
+THUMB_OFF = 1.15  # extended reads ~1.2+
+# A "hand" popping up inside the face box from nowhere is the face misread as
+# a hand. A real hand keeps its trust by tracking in from outside: samples no
+# older than HAND_TRAIL s and no farther apart than HAND_JUMP frame-fractions.
+HAND_TRAIL = 0.5
+HAND_JUMP = 0.3
 
 VK_ALT = 0x12
 VK_VOL_UP, VK_VOL_DOWN = 0xAF, 0xAE
@@ -83,10 +110,17 @@ user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
 user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 _EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
 user32.EnumWindows.argtypes = [_EnumProc, ctypes.c_void_p]
+# ponytail: primary monitor only; switch to virtual-screen metrics if multi-monitor matters
+SCREEN = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
 
 
 def scroll(amount):
     user32.mouse_event(0x0800, 0, 0, int(amount), 0)  # MOUSEEVENTF_WHEEL
+
+
+def click():
+    user32.mouse_event(2, 0, 0, 0, 0)  # LEFTDOWN
+    user32.mouse_event(4, 0, 0, 0, 0)  # LEFTUP
 
 
 def key(vk, up=False):
@@ -191,6 +225,37 @@ def is_fist(lm):
     return all(d(tip) < d(tip - 3) for tip in (8, 12, 16, 20))  # tip-3 = knuckle
 
 
+def is_point(lm):
+    """Index extended, the other three fingertips curled: the air-mouse pose.
+    3D distances: pointing at the screen aims the index at the camera, which
+    foreshortens it to nothing in 2D — only depth still sees it extended."""
+    def d(i):
+        return math.hypot(lm[i].x - lm[0].x, lm[i].y - lm[0].y, lm[i].z - lm[0].z)
+    return d(8) > d(5) and all(d(tip) < d(tip - 3) for tip in (12, 16, 20))
+
+
+def thumb_out(lm):
+    """Thumb extension, self-normalized: tip (4) vs its own IP joint (3),
+    each measured from the pinky knuckle (17). Extended = the tip reaches
+    beyond the joint (> 1); folded across the fist = it dives past the
+    joint toward the pinky (< 1). 3D, so the ratio survives the hand
+    rotating when pointing at the screen edges."""
+    def d(i):
+        return math.hypot(lm[i].x - lm[17].x, lm[i].y - lm[17].y,
+                          lm[i].z - lm[17].z)
+    return d(4) / max(d(3), 1e-6)
+
+
+def air_map(nx, ny):
+    """Fingertip (normalized, unmirrored image coords) -> screen pixel. A box
+    in the upper-middle of the frame spans the whole screen, so every corner
+    stays reachable while the hand stays fully in view."""
+    def span(v, lo, hi):
+        return min(max((v - lo) / (hi - lo), 0.0), 1.0)
+    return (int(span(1 - nx, AIR_MARGIN, 1 - AIR_MARGIN) * (SCREEN[0] - 1)),
+            int(span(ny, *AIR_BOX_Y) * (SCREEN[1] - 1)))  # x mirrored: user-right = image -x
+
+
 def pinch_fsm(mode, streak, ri, rm):
     """One pinch gesture at a time, picked by which tip is nearest the thumb.
 
@@ -248,6 +313,10 @@ def main():
                                      model_complexity=0,  # lighter = faster = re-locks onto fast hands sooner
                                      min_detection_confidence=0.4,  # catch blurred fast hands
                                      min_tracking_confidence=0.2)
+    # Gestures only arm while a face is in view: a hand without you behind it
+    # (pet, passer-by, chair back) must not drive the PC.
+    face = mp.solutions.face_detection.FaceDetection(
+        model_selection=0, min_detection_confidence=0.5)
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # MSMF backend takes ~16s to open here
     if not cap.isOpened():
         raise SystemExit("No camera found.")
@@ -269,10 +338,15 @@ def main():
     last_step = 0
     prev_small = None
     idle = False
+    last_face = face_check = last_point = last_hand = 0.0
+    hand_x = hand_y = 0.0
+    face_box = None
     cover_start = None
     mic_done = True  # pre-"fired": a launch in a dark room must not mute the mic
     fist_start = None
     fist_done = False
+    air_x = air_y = None
+    click_down = False
     try:
         while True:
             if idle:
@@ -285,16 +359,45 @@ def main():
             # Standby: skip MediaPipe (the CPU hog) and poll slowly; the cheap
             # frame-diff below keeps watching and any motion wakes us next frame.
             # ponytail: a sweep from cold standby may need a second try (first one wakes it)
-            result = None if idle else hands.process(
-                cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            ri = rm = 9.9
-            fist = False
-            if result and result.multi_hand_landmarks:
-                lm = result.multi_hand_landmarks[0].landmark
+            rgb = None if idle else cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            if rgb is not None and now - face_check >= FACE_EVERY:
+                face_check = now
+                det = face.process(rgb).detections
+                if det:
+                    last_face = now
+                    b = det[0].location_data.relative_bounding_box
+                    face_box = (b.xmin, b.ymin,
+                                b.xmin + b.width, b.ymin + b.height)
+            armed = now - last_face < FACE_GRACE
+            result = hands.process(rgb) if armed and rgb is not None else None
+            ri = rm = rt = 9.9
+            fist = point = veto = False
+            lm = (result.multi_hand_landmarks[0].landmark
+                  if result and result.multi_hand_landmarks else None)
+            # The low-confidence detector loves finding "hands" in faces: veto
+            # a hand inside the face box unless it earned trust by tracking in
+            # continuously — a real hand slides in, a phantom just appears.
+            if (lm and face_box and (face_box[0] < lm[9].x < face_box[2]
+                                     and face_box[1] < lm[9].y < face_box[3])
+                    and (now - last_hand > HAND_TRAIL
+                         or math.hypot(lm[9].x - hand_x,
+                                       lm[9].y - hand_y) > HAND_JUMP)):
+                lm, veto = None, True
+            if lm:
+                last_hand, hand_x, hand_y = now, lm[9].x, lm[9].y
                 ri, rm = pinch_ratio(lm), pinch_ratio(lm, 12)
+                rt = thumb_out(lm)  # thumb clearance from the fist: the trigger
                 fist = is_fist(lm)
-                if fist:  # fingers pass near the thumb while a fist closes:
-                    mode, streak = None, 0  # never read that as a pinch
+                # A latched pinch keeps priority over the pointer pose.
+                # ponytail: a vol-knob grip with ring+pinky curled reads as
+                # point+click — keep them extended for the knob, or disentangle later
+                if mode is None and is_point(lm):
+                    last_point = now
+                # A real fist ends the pose at once (it's the play/pause
+                # gesture, and its low thumb must not fire the trigger).
+                point = mode is None and not fist and now - last_point < POINT_GRACE
+                if fist or point:  # fingers pass near the thumb while a fist
+                    mode, streak = None, 0  # closes: never read that as a pinch
                 else:
                     mode, streak = pinch_fsm(mode, streak, ri, rm)
             else:
@@ -307,10 +410,13 @@ def main():
             small = cv2.cvtColor(cv2.resize(frame, (80, 45)), cv2.COLOR_BGR2GRAY)
             lum = small.mean()
             # Covering the lens blacks the frame out; hold it to toggle the mic.
+            # The cover hides your face, but COVER_TIME < FACE_GRACE: the fire
+            # lands inside the grace window from the face seen just before.
             # ponytail: a genuinely dark room reads as covered — add a "was
             # recently bright" check if that ever bites
             cover_start, mic_done, fire = hold_step(cover_start, mic_done,
-                                                    lum < COVER_DARK, now, COVER_TIME)
+                                                    armed and lum < COVER_DARK,
+                                                    now, COVER_TIME)
             if fire:
                 winsound.Beep(250 if toggle_mic() else 900, 180)
             fist_start, fist_done, fire = hold_step(fist_start, fist_done,
@@ -331,7 +437,8 @@ def main():
                                           ys.mean() / moving.shape[0])
                     step = 1 if dx < 0 else -1  # unmirrored cam: user-right = -x
                     gap = now - last_swipe
-                    if (abs(dx) > SWIPE_DIST and abs(dx) > 2 * abs(dy)  # horizontal
+                    if (armed and not point  # a pointing hand is mousing, not sweeping
+                            and abs(dx) > SWIPE_DIST and abs(dx) > 2 * abs(dy)  # horizontal
                             and gap > SWIPE_COOLDOWN
                             and (step == last_step or gap > REVERSE_COOLDOWN)):
                         switch_window(step)
@@ -370,16 +477,49 @@ def main():
             else:
                 vol_angle = None
                 vol_acc = 0.0
+            if point:
+                last_motion = now  # a hovering pointer barely moves pixels
+                if air_x is None:  # entering the pose: a thumb that starts
+                    air_x, air_y = lm[8].x, lm[8].y  # down must not fire
+                    click_down = rt < THUMB_OFF
+                else:
+                    air_x += AIR_SMOOTH * (lm[8].x - air_x)  # EMA against jitter
+                    air_y += AIR_SMOOTH * (lm[8].y - air_y)
+                user32.SetCursorPos(*air_map(air_x, air_y))
+                # Click = folding the extended thumb back onto the fist.
+                # Both thumb states are unoccluded — unlike the old
+                # thumb-to-curled-middle pinch, whose hidden fingertip the
+                # tracker kept guessing wrong.
+                down = rt < (THUMB_OFF if click_down else THUMB_ON)
+                if down and not click_down:
+                    click()
+                click_down = down
+            else:
+                air_x = None
+                click_down = False
             if debug:
+                if lm:
+                    mp.solutions.drawing_utils.draw_landmarks(
+                        frame, result.multi_hand_landmarks[0],
+                        mp.solutions.hands.HAND_CONNECTIONS)
+                if face_box:
+                    fh, fw = frame.shape[:2]
+                    cv2.rectangle(frame,
+                                  (int(face_box[0] * fw), int(face_box[1] * fh)),
+                                  (int(face_box[2] * fw), int(face_box[3] * fh)),
+                                  (255, 200, 0), 1)
                 cv2.putText(frame,
-                            f"hand {'Y' if result and result.multi_hand_landmarks else '-'}"
-                            f"  ri {ri:.2f}  rm {rm:.2f}  mode {mode or '-'}"
-                            f"  fist {int(fist)}",
+                            f"hand {'X' if veto else 'Y' if lm else '-'}"
+                            f"  ri {ri:.2f}  rm {rm:.2f}  rt {rt:.2f}",
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.putText(frame,
                             f"mot {frac:.2f}  dx {dx:+.2f}  lum {lum:.0f}"
-                            f"  idle {int(idle)}",
+                            f"  idle {int(idle)}  armed {int(armed)}",
                             (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(frame,
+                            f"mode {mode or '-'}  fist {int(fist)}"
+                            f"  pt {int(point)}{'*' * click_down}",
+                            (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.imshow("pinch_scroll debug", frame)
                 cv2.waitKey(1)
     except KeyboardInterrupt:
@@ -401,7 +541,7 @@ if __name__ == "__main__":
 
     # self-check: pinch ratio is scale-invariant
     class P:
-        def __init__(self, x, y): self.x, self.y = x, y
+        def __init__(self, x, y, z=0.0): self.x, self.y, self.z = x, y, z
     def hand(scale):
         lm = [P(0, 0)] * 21
         lm[0], lm[9] = P(0, 0), P(0, scale)          # hand size
@@ -454,6 +594,11 @@ if __name__ == "__main__":
                    for t in range(60))       # repositioning-speed drift stays under
     assert len(slow) <= SWIPE_TIME * 30 + 1  # old samples really get pruned
 
+    # self-check: covering the lens hides the face, so the mute can only fire
+    # off the grace window — the knobs must keep that window wide enough
+    assert COVER_TIME < FACE_GRACE
+    assert FACE_EVERY < FACE_GRACE  # a check gap must not outlive the grace
+
     # self-check: hold fires once per sustained stretch; pre-done doesn't fire
     T = COVER_TIME
     s, d, f = hold_step(None, False, True, 10.0, T)  # cover begins
@@ -481,6 +626,30 @@ if __name__ == "__main__":
     assert not is_fist(pose())              # open hand
     assert not is_fist(pose(12))            # volume-knob grip: middle curled
     assert not is_fist(pose(8))             # scroll pinch: index curled
+
+    # self-check: air-mouse pose = index out, others curled; fist/open are not
+    assert is_point(pose(12, 16, 20))
+    assert not is_point(pose(8, 12, 16, 20))  # fist
+    assert not is_point(pose())               # open hand
+    assert not is_point(pose(8))              # scroll pinch
+    cam = pose(12, 16, 20)                    # index aimed at the camera:
+    cam[8] = P(0.4, 0, -0.5)                  # flat in 2D, extended in depth
+    assert is_point(cam)
+
+    # self-check: trigger thumb — folded onto the fist reads pulled, extended reads armed
+    gun = pose(12, 16, 20)
+    gun[3] = P(0.2, -0.15)                       # thumb IP joint, out to the side
+    gun[4] = P(0.35, 0.1)                        # tip folded in past the joint
+    assert thumb_out(gun) < THUMB_ON
+    gun[4] = P(0.1, -0.3)                        # tip extended beyond the joint
+    assert thumb_out(gun) > THUMB_OFF
+
+    # self-check: air map mirrors x and pins the margin box to the screen edges
+    assert air_map(1.0, 0.0) == (0, 0)
+    assert air_map(0.0, 1.0) == (SCREEN[0] - 1, SCREEN[1] - 1)
+    assert air_map(0.5, AIR_BOX_Y[0])[1] == 0
+    assert air_map(0.5, AIR_BOX_Y[1])[1] == SCREEN[1] - 1
+    assert air_map(0.3, 0.5)[0] > air_map(0.7, 0.5)[0]  # user-right -> screen-right
 
     # self-check: rightward sweep = image x decreasing, and it reads as horizontal
     r = deque()
