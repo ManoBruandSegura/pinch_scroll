@@ -26,8 +26,11 @@ fast hand to motion blur, but blur only makes the motion signal stronger.
 Gestures only work while your face is in view of the camera (with a couple of
 seconds of grace), so a stray hand with nobody at the desk moves nothing.
 
-Runs headless. Launching it again stops the running instance (high beep = started,
-low beep = stopped).
+Runs headless with a tray icon: green = armed, gray = standby/paused, red
+corner dot = mic muted. The menu pauses gestures (double-click the icon does
+too), toggles the air mouse, registers the app to start with Windows, and
+quits. Launching it again also stops the running instance (high beep =
+started, low beep = stopped).
 """
 import ctypes
 import math
@@ -195,16 +198,56 @@ def angle_step(prev, cur):
     return (cur - prev + 180) % 360 - 180
 
 
+_mic = None
+
+
+def mic_vol():
+    """The default microphone's volume endpoint (cached: letting the COM
+    pointer get garbage-collected trips an access violation in comtypes)."""
+    global _mic
+    if _mic is None:
+        from comtypes import CLSCTX_ALL
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+        _mic = ctypes.cast(AudioUtilities.GetMicrophone().Activate(
+            IAudioEndpointVolume._iid_, CLSCTX_ALL, None),
+            ctypes.POINTER(IAudioEndpointVolume))
+    return _mic
+
+
 def toggle_mic():
     """Flip the default microphone's mute; return True if now muted."""
-    from comtypes import CLSCTX_ALL
-    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-    vol = ctypes.cast(AudioUtilities.GetMicrophone().Activate(
-        IAudioEndpointVolume._iid_, CLSCTX_ALL, None),
-        ctypes.POINTER(IAudioEndpointVolume))
+    vol = mic_vol()
     muted = not vol.GetMute()
     vol.SetMute(muted, None)
     return muted
+
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def startup_on():
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            winreg.QueryValueEx(k, "PinchScroll")
+        return True
+    except OSError:
+        return False
+
+
+def startup_toggle():
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                        winreg.KEY_ALL_ACCESS) as k:
+        if startup_on():
+            winreg.DeleteValue(k, "PinchScroll")
+        elif getattr(sys, "frozen", False):  # the PyInstaller build
+            winreg.SetValueEx(k, "PinchScroll", 0, winreg.REG_SZ,
+                              f'"{sys.executable}"')
+        else:  # script run: pythonw = no console window at login
+            pyw = sys.executable.replace("python.exe", "pythonw.exe")
+            winreg.SetValueEx(k, "PinchScroll", 0, winreg.REG_SZ,
+                              f'"{pyw}" "{os.path.abspath(__file__)}"')
 
 
 def hold_step(start, done, on, now, hold):
@@ -329,6 +372,50 @@ def main():
     if not cap.isOpened():
         raise SystemExit("No camera found.")
 
+    # Tray icon: a status LED (green = armed, gray = standby/paused, red
+    # corner dot = mic muted) with flag-flipping menu items the loop reads.
+    ui = {"paused": False, "air": True, "quit": False, "status": "starting"}
+    try:
+        mic_muted = bool(mic_vol().GetMute())
+    except Exception:  # no mic: the red dot just never shows
+        mic_muted = False
+    tray = None
+    try:
+        import pystray
+        from PIL import Image, ImageDraw
+
+        def led(armed, muted):
+            img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            d.ellipse((8, 8, 56, 56),
+                      fill=(0, 200, 80) if armed else (130, 130, 130))
+            if muted:
+                d.ellipse((34, 34, 62, 62), fill=(220, 40, 40))
+            return img
+
+        def flip(key):
+            return lambda icon, item: ui.update({key: not ui[key]})
+
+        tray = pystray.Icon(
+            "pinch_scroll", led(False, mic_muted), "Pinch Scroll",
+            pystray.Menu(
+                pystray.MenuItem(lambda item: f"Pinch Scroll — {ui['status']}",
+                                 None, enabled=False),
+                pystray.MenuItem("Pause gestures", flip("paused"),
+                                 checked=lambda item: ui["paused"],
+                                 default=True),  # default: double-click = pause
+                pystray.MenuItem("Air mouse", flip("air"),
+                                 checked=lambda item: ui["air"]),
+                pystray.MenuItem("Start with Windows",
+                                 lambda icon, item: startup_toggle(),
+                                 checked=lambda item: startup_on()),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Quit", flip("quit"))))
+        tray.run_detached()
+    except ImportError:
+        pass  # ponytail: no pystray = no tray; the beeps still tell the story
+    tray_state = None
+
     debug = "--debug" in sys.argv  # shows the camera feed + tracker state
     print("Pinch to set an anchor, hold hand above/below it to scroll. Ctrl+C to quit.")
     winsound.Beep(800, 200)  # high beep: started
@@ -356,7 +443,7 @@ def main():
     air_x = air_y = None
     click_down = False
     try:
-        while True:
+        while not ui["quit"]:
             if idle:
                 time.sleep(0.45)  # ~2 fps is plenty for spotting wake motion
             ok, frame = cap.read()
@@ -376,7 +463,12 @@ def main():
                     b = det[0].location_data.relative_bounding_box
                     face_box = (b.xmin, b.ymin,
                                 b.xmin + b.width, b.ymin + b.height)
-            armed = now - last_face < FACE_GRACE
+            armed = not ui["paused"] and now - last_face < FACE_GRACE
+            state = "paused" if ui["paused"] else "armed" if armed else "standby"
+            if tray and (state, mic_muted) != tray_state:
+                tray_state = (state, mic_muted)
+                ui["status"] = state
+                tray.icon = led(armed, mic_muted)
             result = hands.process(rgb) if armed and rgb is not None else None
             ri = rm = rt = 9.9
             fist = point = veto = False
@@ -403,7 +495,8 @@ def main():
                     last_point = now
                 # A real fist ends the pose at once (it's the play/pause
                 # gesture, and its low thumb must not fire the trigger).
-                point = mode is None and not fist and now - last_point < POINT_GRACE
+                point = (ui["air"] and mode is None and not fist
+                         and now - last_point < POINT_GRACE)
                 if fist or point:  # fingers pass near the thumb while a fist
                     mode, streak = None, 0  # closes: never read that as a pinch
                 else:
@@ -426,7 +519,8 @@ def main():
                                                     armed and lum < COVER_DARK,
                                                     now, COVER_TIME)
             if fire:
-                winsound.Beep(250 if toggle_mic() else 900, 180)
+                mic_muted = toggle_mic()
+                winsound.Beep(250 if mic_muted else 900, 180)
             fist_start, fist_done, fire = hold_step(fist_start, fist_done,
                                                     fist, now, FIST_TIME)
             if fire:  # open the hand to re-arm; holding the fist won't refire
@@ -533,6 +627,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if tray:
+            tray.stop()
         cap.release()
         try:
             os.remove(PIDFILE)  # killed-via-toggle leaves this to the tasklist check

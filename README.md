@@ -18,6 +18,7 @@ No need to reposition your hand; to keep scrolling, just keep holding the offset
 - **Mic mute toggle**: Cover the webcam with your hand for about a second to mute the system microphone; cover it again to unmute. A low beep means muted, a high beep means live. Works even from idle standby.
 - **Sweep to switch apps**: Sweep a hand quickly sideways to switch windows. Open apps form a fixed ring (no Alt+Tab recency reshuffling): sweep right = next app, sweep left = previous app, switched instantly. A short beep confirms each sweep. Detection is motion-based, so any speed works — the faster the sweep, the stronger the signal. The quick return stroke after a sweep is deliberately ignored; to go back the other way, pause ~1.5s first.
 - **Headless and lightweight**: Runs silently in the background without opening any distracting windows.
+- **Tray icon**: a status LED in the system tray — green = gestures armed (face in view), gray = standby or paused, red corner dot = mic muted. Right-click to pause all gestures (double-clicking the icon does the same), toggle the air mouse, register the app to start with Windows, or quit.
 - **Idle standby**: After 30s without motion in view, the hand tracker (the CPU-heavy part) is paused and the camera is polled at ~2 fps with only a tiny frame-diff watching. Any motion wakes it within half a second.
 - **Toggle to Stop**: Run the application once to start it. Run it again to gracefully stop the existing instance.
 - **Audible Cues**: Emits a high-pitched beep when started and a low-pitched beep when stopped.
